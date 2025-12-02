@@ -31,6 +31,12 @@ from pipeline_stable_diffusion_xl_instantid_full import (
 
 import gradio as gr
 
+from depth_anything.dpt import DepthAnything
+from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
+
+import torch.nn.functional as F
+from torchvision.transforms import Compose
+
 
 # ============ GLOBAL CONFIG ============
 MAX_SEED = np.iinfo(np.int32).max
@@ -203,16 +209,34 @@ hf_hub_download(
     repo_id="InstantX/InstantID", filename="ip-adapter.bin", local_dir="./checkpoints"
 )
 
-from insightface.app import FaceAnalysis
-
 # Face encoder
 app = FaceAnalysis(
-    name="buffalo_l",
-    root="./models",
-    allowed_modules=["detection", "recognition"],
+    name="antelopev2",
+    root="./",
     providers=["CPUExecutionProvider"],
 )
 app.prepare(ctx_id=0, det_size=(640, 640))
+
+# DepthAnything
+depth_anything = DepthAnything.from_pretrained(
+    "LiheYoung/depth_anything_vitl14"
+).to(device).eval()
+
+transform = Compose(
+    [
+        Resize(
+            width=518,
+            height=518,
+            resize_target=False,
+            keep_aspect_ratio=True,
+            ensure_multiple_of=14,
+            resize_method="lower_bound",
+            image_interpolation_method=cv2.INTER_CUBIC,
+        ),
+        NormalizeImage(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        PrepareForNet(),
+    ]
+)
 
 face_adapter = "./checkpoints/ip-adapter.bin"
 controlnet_path = "./checkpoints/ControlNetModel"
@@ -222,10 +246,30 @@ controlnet_identitynet = ControlNetModel.from_pretrained(
 )
 
 controlnet_canny_model = "diffusers/controlnet-canny-sdxl-1.0"
+controlnet_depth_model = "diffusers/controlnet-depth-sdxl-1.0-small"
 
 controlnet_canny = ControlNetModel.from_pretrained(
     controlnet_canny_model, torch_dtype=dtype
 ).to(device)
+controlnet_depth = ControlNetModel.from_pretrained(
+    controlnet_depth_model, torch_dtype=dtype
+).to(device)
+
+
+def get_depth_map(image):
+    image = np.array(image) / 255.0
+    h, w = image.shape[:2]
+    image = transform({"image": image})["image"]
+    image = torch.from_numpy(image).unsqueeze(0).to("cuda")
+    with torch.no_grad():
+        depth = depth_anything(image)
+    depth = F.interpolate(
+        depth[None], (h, w), mode="bilinear", align_corners=False
+    )[0, 0]
+    depth = (depth - depth.min()) / (depth.max() - depth.min()) * 255.0
+    depth = depth.cpu().numpy().astype(np.uint8)
+    depth_image = Image.fromarray(depth)
+    return depth_image
 
 
 def get_canny_image(image, t1=100, t2=200):
@@ -236,9 +280,11 @@ def get_canny_image(image, t1=100, t2=200):
 
 controlnet_map = {
     "canny": controlnet_canny,
+    "depth": controlnet_depth,
 }
 controlnet_map_fn = {
     "canny": get_canny_image,
+    "depth": get_depth_map,
 }
 
 pretrained_model_name_or_path = "wangqixun/YamerMIX_v8"
@@ -256,11 +302,10 @@ pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
     pipe.scheduler.config
 )
 
-# Move pipeline and submodules to selected device
+pipe.cuda()
 pipe.load_ip_adapter_instantid(face_adapter)
-pipe.to(device, dtype=dtype)
-pipe.image_proj_model.to(device)
-pipe.unet.to(device)
+pipe.image_proj_model.to("cuda")
+pipe.unet.to("cuda")
 
 
 # ============ UTILS ============
@@ -349,7 +394,7 @@ def save_as_png(image, filename="professional_headshot"):
 
 
 # ============ GENERATION FUNCTION ============
-@spaces.GPU
+@spaces.GPU  # ZeroGPU will allocate GPU for this function
 def generate_image(
     face_image_path,
     license_key,
@@ -360,12 +405,12 @@ def generate_image(
     identitynet_strength_ratio,
     adapter_strength_ratio,
     canny_strength,
-    depth_strength,          # kept in signature but unused
+    depth_strength,
     controlnet_selection,
     guidance_scale,
     seed,
     scheduler,
-    enable_LCM,
+    enable_LCM,  # kept for UI, but ignored in logic
     enhance_face_region,
     progress=gr.Progress(track_tqdm=True),
 ):
@@ -380,16 +425,15 @@ def generate_image(
                 f"""
 ❌ Your free trial has ended.
 You’ve used all {MAX_FREE_TRIALS} free generations for this account.
-
 🔑 To continue generating headshots:
 1. Purchase a premium license for unlimited HD downloads (no watermark), or
 2. Enter an existing license key if you already purchased.
-
 Visit: https://canadianheadshotpro.carrd.co
 Support: bee.tools@zohomailcloud.ca
 """
             )
 
+    # Always use a standard scheduler (no LCM / LoRA)
     scheduler_class_name = scheduler.split("-")[0]
     add_kwargs = {}
     if len(scheduler.split("-")) > 1:
@@ -435,10 +479,10 @@ Support: bee.tools@zohomailcloud.ca
     else:
         control_mask = None
 
-    # Force only canny controlnet
     if len(controlnet_selection) > 0:
         controlnet_scales = {
             "canny": canny_strength,
+            "depth": depth_strength,
         }
         pipe.controlnet = MultiControlNetModel(
             [controlnet_identitynet]
@@ -782,7 +826,7 @@ with gr.Blocks() as demo:
     randomize_seed = gr.Checkbox(value=True, visible=False)
     enhance_face_region = gr.Checkbox(value=True, visible=False)
     controlnet_selection = gr.CheckboxGroup(
-        choices=["canny"], value=["canny"], label="Controlnet", visible=False
+        choices=["canny", "depth"], value=["depth"], label="Controlnet", visible=False
     )
     canny_strength = gr.Slider(
         minimum=0,
@@ -792,7 +836,7 @@ with gr.Blocks() as demo:
         label="Canny strength",
         visible=False,
     )
-    depth_strength = gr.Slider(  # kept but unused
+    depth_strength = gr.Slider(
         minimum=0,
         maximum=1.5,
         step=0.01,
