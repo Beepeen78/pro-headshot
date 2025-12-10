@@ -1,26 +1,27 @@
+"""
+Pro AI Headshot Generator - Public Access Version
+Transforms any selfie into professional headshots using AI.
+"""
 import cv2
 import torch
 import random
 import numpy as np
 import os
 import time
-import secrets
-import json
+import glob
+from pathlib import Path
+from typing import Tuple, Optional
 from datetime import datetime, timedelta
-from typing import Tuple
 
 import spaces
-
 import PIL
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image
 
 import diffusers
 from diffusers.utils import load_image
 from diffusers.models import ControlNetModel
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
-
 from huggingface_hub import hf_hub_download
-
 from insightface.app import FaceAnalysis
 
 from style_template import styles
@@ -28,171 +29,138 @@ from pipeline_stable_diffusion_xl_instantid_full import (
     StableDiffusionXLInstantIDPipeline,
     draw_kps,
 )
-
 import gradio as gr
 
 from depth_anything.dpt import DepthAnything
 from depth_anything.util.transform import Resize, NormalizeImage, PrepareForNet
-
 import torch.nn.functional as F
 from torchvision.transforms import Compose
+
+from config import (
+    TEMP_DIR,
+    MAX_FILE_AGE_HOURS,
+    MAX_IMAGE_SIZE_MB,
+    ALLOWED_IMAGE_FORMATS,
+    MIN_IMAGE_DIMENSION,
+    MAX_IMAGE_DIMENSION,
+    MAX_PROMPT_LENGTH,
+    MAX_NEGATIVE_PROMPT_LENGTH,
+    DEFAULT_NUM_STEPS,
+    DEFAULT_GUIDANCE_SCALE,
+    DEFAULT_SEED,
+)
 
 
 # ============ GLOBAL CONFIG ============
 MAX_SEED = np.iinfo(np.int32).max
+
+# Device detection - fixed logic
 device = "cuda" if torch.cuda.is_available() else "cpu"
-dtype = torch.float16 if str(device).__contains__("cuda") else torch.float32
+dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 STYLE_NAMES = list(styles.keys())
 
-LICENSE_FILE = "valid_licenses.json"
-TRIAL_FILE = "user_trials.json"
-MAX_FREE_TRIALS = 3
 
-ADMIN_KEYS = {
-    "HEADSHOT-TEST123456",
-    "HEADSHOT-OWNERACCESS",
-    "HEADSHOT-DEVELOPER123",
-    "HEADSHOT-ADMIN789012",
-}
+# ============ FILE MANAGEMENT ============
+def cleanup_old_files():
+    """Remove files older than MAX_FILE_AGE_HOURS from temp directory."""
+    if not TEMP_DIR.exists():
+        return
+    
+    cutoff_time = time.time() - (MAX_FILE_AGE_HOURS * 3600)
+    deleted_count = 0
+    
+    for file_path in TEMP_DIR.glob("*"):
+        if file_path.is_file():
+            try:
+                if file_path.stat().st_mtime < cutoff_time:
+                    file_path.unlink()
+                    deleted_count += 1
+            except Exception as e:
+                print(f"Warning: Could not delete {file_path}: {e}")
+    
+    if deleted_count > 0:
+        print(f"Cleaned up {deleted_count} old files from temp directory")
 
 
-# ============ LICENSE / TRIAL SYSTEM ============
-def load_licenses():
+def save_as_png(image: Image.Image, filename: str = "professional_headshot") -> str:
+    """Save image as PNG in temp directory with cleanup."""
+    # Cleanup old files before saving new ones
+    cleanup_old_files()
+    
+    TEMP_DIR.mkdir(exist_ok=True, parents=True)
+    timestamp = int(time.time())
+    filepath = TEMP_DIR / f"{filename}_{timestamp}.png"
+
+    # Ensure image is in RGB mode
+    if image.mode in ("RGBA", "LA"):
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.split()[-1])
+        image = background
+    elif image.mode != "RGB":
+        image = image.convert("RGB")
+
+    image.save(filepath, "PNG", optimize=True)
+    return str(filepath)
+
+
+# ============ INPUT VALIDATION ============
+def validate_image_file(file_path: str) -> Tuple[bool, Optional[str]]:
+    """Validate uploaded image file."""
+    if not file_path:
+        return False, "Please upload an image file."
+    
+    # Check file exists
+    if not os.path.exists(file_path):
+        return False, "Uploaded file not found. Please try again."
+    
+    # Check file extension
+    ext = Path(file_path).suffix.lower()
+    if ext not in ALLOWED_IMAGE_FORMATS:
+        return False, f"Unsupported file format. Allowed formats: {', '.join(ALLOWED_IMAGE_FORMATS)}"
+    
+    # Check file size
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    if file_size_mb > MAX_IMAGE_SIZE_MB:
+        return False, f"File too large. Maximum size: {MAX_IMAGE_SIZE_MB}MB"
+    
+    # Try to open and validate image
     try:
-        with open(LICENSE_FILE, "r") as f:
-            return set(json.load(f))
-    except FileNotFoundError:
-        initial_licenses = ADMIN_KEYS.copy()
-        save_licenses(initial_licenses)
-        return initial_licenses
+        with Image.open(file_path) as img:
+            width, height = img.size
+            if width < MIN_IMAGE_DIMENSION or height < MIN_IMAGE_DIMENSION:
+                return False, f"Image too small. Minimum size: {MIN_IMAGE_DIMENSION}x{MIN_IMAGE_DIMENSION}px"
+            if width > MAX_IMAGE_DIMENSION or height > MAX_IMAGE_DIMENSION:
+                return False, f"Image too large. Maximum size: {MAX_IMAGE_DIMENSION}x{MAX_IMAGE_DIMENSION}px"
+    except Exception as e:
+        return False, f"Invalid image file: {str(e)}"
+    
+    return True, None
 
 
-def save_licenses(licenses):
-    with open(LICENSE_FILE, "w") as f:
-        json.dump(list(licenses), f)
+def validate_prompt(prompt: str) -> Tuple[bool, Optional[str]]:
+    """Validate prompt input."""
+    if not prompt or not prompt.strip():
+        return True, None  # Empty prompt is allowed (will use default)
+    
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        return False, f"Prompt too long. Maximum length: {MAX_PROMPT_LENGTH} characters"
+    
+    return True, None
 
 
-def generate_license_key():
-    license_key = f"HEADSHOT-{secrets.token_hex(6).upper()}"
-    valid_licenses = load_licenses()
-    valid_licenses.add(license_key)
-    save_licenses(valid_licenses)
-    return license_key
-
-
-def verify_license(license_key):
-    if not license_key or not license_key.strip():
-        return False
-
-    license_upper = license_key.strip().upper()
-
-    if license_upper in ADMIN_KEYS:
-        print(f"✅ Admin access granted with: {license_upper}")
-        return True
-
-    valid_licenses = load_licenses()
-    return license_upper in valid_licenses
-
-
-def load_trials():
-    try:
-        with open(TRIAL_FILE, "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return {}
-
-
-def save_trials(trials_data):
-    with open(TRIAL_FILE, "w") as f:
-        json.dump(trials_data, f)
-
-
-def get_user_identifier():
-    # Simple identifier for Spaces
-    return "gradio_user"
-
-
-def can_use_free_trial(user_id):
-    trials_data = load_trials()
-
-    if user_id not in trials_data:
-        return True, MAX_FREE_TRIALS
-
-    user_data = trials_data[user_id]
-    trials_used = user_data.get("trials_used", 0)
-    first_trial_date = user_data.get("first_trial_date")
-
-    if first_trial_date:
-        first_date = datetime.fromisoformat(first_trial_date)
-        if datetime.now() - first_date > timedelta(days=30):
-            trials_used = 0
-            user_data["trials_used"] = 0
-            user_data["first_trial_date"] = datetime.now().isoformat()
-            save_trials(trials_data)
-
-    trials_left = MAX_FREE_TRIALS - trials_used
-    return trials_left > 0, trials_left
-
-
-def record_trial_usage(user_id):
-    trials_data = load_trials()
-
-    if user_id not in trials_data:
-        trials_data[user_id] = {
-            "trials_used": 1,
-            "first_trial_date": datetime.now().isoformat(),
-            "last_used": datetime.now().isoformat(),
-        }
-    else:
-        trials_data[user_id]["trials_used"] += 1
-        trials_data[user_id]["last_used"] = datetime.now().isoformat()
-
-    save_trials(trials_data)
-
-
-def apply_watermark(image):
-    if hasattr(image, "mode"):
-        pil_image = image
-    else:
-        pil_image = Image.fromarray(image)
-
-    draw = ImageDraw.Draw(pil_image, "RGBA")
-    width, height = pil_image.size
-
-    watermark_text = "PREVIEW - UPGRADE TO DOWNLOAD"
-
-    try:
-        font = ImageFont.truetype("arial.ttf", min(width, height) // 20)
-    except Exception:
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                min(width, height) // 20,
-            )
-        except Exception:
-            font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), watermark_text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-
-    x = (width - text_width) // 2
-    y = height - text_height - 50
-
-    draw.rectangle(
-        [x - 10, y - 10, x + text_width + 10, y + text_height + 10],
-        fill=(0, 0, 0, 128),
-    )
-    draw.text((x, y), watermark_text, fill=(255, 255, 255, 255), font=font)
-
-    return pil_image
-
-
-VALID_LICENSES = load_licenses()
-print(f"✅ License system initialized. Admin keys: {ADMIN_KEYS}")
+def validate_negative_prompt(negative_prompt: str) -> Tuple[bool, Optional[str]]:
+    """Validate negative prompt input."""
+    if not negative_prompt:
+        return True, None
+    
+    if len(negative_prompt) > MAX_NEGATIVE_PROMPT_LENGTH:
+        return False, f"Negative prompt too long. Maximum length: {MAX_NEGATIVE_PROMPT_LENGTH} characters"
+    
+    return True, None
 
 
 # ============ MODEL LOADING ============
+print("Loading AI models... This may take a few minutes on first run.")
 
 # InstantID checkpoints
 hf_hub_download(
@@ -257,10 +225,11 @@ controlnet_depth = ControlNetModel.from_pretrained(
 
 
 def get_depth_map(image):
+    """Generate depth map from image."""
     image = np.array(image) / 255.0
     h, w = image.shape[:2]
     image = transform({"image": image})["image"]
-    image = torch.from_numpy(image).unsqueeze(0).to("cuda")
+    image = torch.from_numpy(image).unsqueeze(0).to(device)
     with torch.no_grad():
         depth = depth_anything(image)
     depth = F.interpolate(
@@ -273,6 +242,7 @@ def get_depth_map(image):
 
 
 def get_canny_image(image, t1=100, t2=200):
+    """Generate canny edge map from image."""
     image = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
     edges = cv2.Canny(image, t1, t2)
     return Image.fromarray(edges, "L")
@@ -297,19 +267,25 @@ pipe = StableDiffusionXLInstantIDPipeline.from_pretrained(
     feature_extractor=None,
 ).to(device)
 
-# Standard scheduler (no LCM / LoRA here)
+# Standard scheduler
 pipe.scheduler = diffusers.EulerDiscreteScheduler.from_config(
     pipe.scheduler.config
 )
 
-pipe.cuda()
-pipe.load_ip_adapter_instantid(face_adapter)
-pipe.image_proj_model.to("cuda")
-pipe.unet.to("cuda")
+if device == "cuda":
+    pipe.cuda()
+    pipe.load_ip_adapter_instantid(face_adapter)
+    pipe.image_proj_model.to("cuda")
+    pipe.unet.to("cuda")
+else:
+    pipe.load_ip_adapter_instantid(face_adapter)
+
+print("✅ Models loaded successfully!")
 
 
 # ============ UTILS ============
-def toggle_lcm_ui(value):
+def toggle_lcm_ui(value: bool) -> Tuple[dict, dict]:
+    """Toggle UI for LCM mode."""
     if value:
         return (
             gr.update(minimum=0, maximum=100, step=1, value=5),
@@ -317,22 +293,25 @@ def toggle_lcm_ui(value):
         )
     else:
         return (
-            gr.update(minimum=5, maximum=100, step=1, value=30),
-            gr.update(minimum=0.1, maximum=20.0, step=0.1, value=5),
+            gr.update(minimum=5, maximum=100, step=1, value=DEFAULT_NUM_STEPS),
+            gr.update(minimum=0.1, maximum=20.0, step=0.1, value=DEFAULT_GUIDANCE_SCALE),
         )
 
 
 def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
+    """Randomize seed if requested."""
     if randomize_seed:
         seed = random.randint(0, MAX_SEED)
     return seed
 
 
-def convert_from_cv2_to_image(img: np.ndarray) -> Image:
+def convert_from_cv2_to_image(img: np.ndarray) -> Image.Image:
+    """Convert OpenCV image to PIL Image."""
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 
-def convert_from_image_to_cv2(img: Image) -> np.ndarray:
+def convert_from_image_to_cv2(img: Image.Image) -> np.ndarray:
+    """Convert PIL Image to OpenCV format."""
     return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
@@ -345,6 +324,7 @@ def resize_img(
     mode=PIL.Image.BILINEAR,
     base_pixel_number=64,
 ):
+    """Resize image maintaining aspect ratio."""
     w, h = input_image.size
     if size is not None:
         w_resize_new, h_resize_new = size
@@ -369,174 +349,296 @@ def resize_img(
 
 
 def apply_style(style_name: str, positive: str, negative: str = "") -> Tuple[str, str]:
+    """Apply style template to prompts."""
     if style_name == "No Style":
         return positive, negative
     p, n = styles.get(style_name, ("{prompt}", ""))
     return p.replace("{prompt}", positive), n + " " + negative
 
 
-def save_as_png(image, filename="professional_headshot"):
-    temp_dir = "temp_downloads"
-    os.makedirs(temp_dir, exist_ok=True)
-
-    timestamp = int(time.time())
-    filepath = os.path.join(temp_dir, f"{filename}_{timestamp}.png")
-
-    if image.mode in ("RGBA", "LA"):
-        background = Image.new("RGB", image.size, (255, 255, 255))
-        background.paste(image, mask=image.split()[-1])
-        image = background
-    elif image.mode != "RGB":
-        image = image.convert("RGB")
-
-    image.save(filepath, "PNG", optimize=True)
-    return filepath
-
-
 # ============ GENERATION FUNCTION ============
 @spaces.GPU  # ZeroGPU will allocate GPU for this function
 def generate_image(
-    face_image_path,
-    license_key,
-    prompt,
-    negative_prompt,
-    style_name,
-    num_steps,
-    identitynet_strength_ratio,
-    adapter_strength_ratio,
-    canny_strength,
-    depth_strength,
-    controlnet_selection,
-    guidance_scale,
-    seed,
-    scheduler,
-    enable_LCM,  # kept for UI, but ignored in logic
-    enhance_face_region,
+    face_image_path: str,
+    prompt: str,
+    negative_prompt: str,
+    style_name: str,
+    num_steps: int,
+    identitynet_strength_ratio: float,
+    adapter_strength_ratio: float,
+    canny_strength: float,
+    depth_strength: float,
+    controlnet_selection: list,
+    guidance_scale: float,
+    seed: int,
+    scheduler: str,
+    enable_LCM: bool,
+    enhance_face_region: bool,
     progress=gr.Progress(track_tqdm=True),
 ):
-    user_id = get_user_identifier()
-    has_valid_license = verify_license(license_key)
+    """Generate professional headshot from face image."""
+    try:
+        # Validate inputs
+        is_valid, error_msg = validate_image_file(face_image_path)
+        if not is_valid:
+            raise gr.Error(error_msg)
+        
+        is_valid, error_msg = validate_prompt(prompt)
+        if not is_valid:
+            raise gr.Error(error_msg)
+        
+        is_valid, error_msg = validate_negative_prompt(negative_prompt)
+        if not is_valid:
+            raise gr.Error(error_msg)
 
-    if not has_valid_license:
-        can_use_trial, trials_left = can_use_free_trial(user_id)
+        # Randomize seed if needed
+        if seed < 0:
+            seed = random.randint(0, MAX_SEED)
 
-        if not can_use_trial:
+        # Configure scheduler
+        scheduler_class_name = scheduler.split("-")[0]
+        add_kwargs = {}
+        if len(scheduler.split("-")) > 1:
+            add_kwargs["use_karras_sigmas"] = True
+        if len(scheduler.split("-")) > 2:
+            add_kwargs["algorithm_type"] = "sde-dpmsolver++"
+        scheduler_cls = getattr(diffusers, scheduler_class_name)
+        pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config, **add_kwargs)
+
+        # Apply style
+        if not prompt:
+            prompt = "a person"
+        
+        prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
+
+        # Load and process face image
+        face_image = load_image(face_image_path)
+        face_image = resize_img(face_image, max_side=1024)
+        face_image_cv2 = convert_from_image_to_cv2(face_image)
+        height, width, _ = face_image_cv2.shape
+
+        # Detect face
+        face_info = app.get(face_image_cv2)
+        if len(face_info) == 0:
             raise gr.Error(
-                f"""
-❌ Your free trial has ended.
-You’ve used all {MAX_FREE_TRIALS} free generations for this account.
-🔑 To continue generating headshots:
-1. Purchase a premium license for unlimited HD downloads (no watermark), or
-2. Enter an existing license key if you already purchased.
-Visit: https://canadianheadshotpro.carrd.co
-Support: bee.tools@zohomailcloud.ca
-"""
+                "Unable to detect a face in the image. Please upload a different photo with a clear face."
             )
 
-    # Always use a standard scheduler (no LCM / LoRA)
-    scheduler_class_name = scheduler.split("-")[0]
-    add_kwargs = {}
-    if len(scheduler.split("-")) > 1:
-        add_kwargs["use_karras_sigmas"] = True
-    if len(scheduler.split("-")) > 2:
-        add_kwargs["algorithm_type"] = "sde-dpmsolver++"
-    scheduler_cls = getattr(diffusers, scheduler_class_name)
-    pipe.scheduler = scheduler_cls.from_config(pipe.scheduler.config, **add_kwargs)
+        # Use largest detected face
+        face_info = sorted(
+            face_info,
+            key=lambda x: (x["bbox"][2] - x["bbox"][0]) * (x["bbox"][3] - x["bbox"][1]),
+        )[-1]
+        face_emb = face_info["embedding"]
+        face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info["kps"])
+        img_controlnet = face_image
 
-    if face_image_path is None:
-        raise gr.Error("Please upload a face image.")
+        # Create control mask if requested
+        if enhance_face_region:
+            control_mask = np.zeros([height, width, 3])
+            x1, y1, x2, y2 = face_info["bbox"]
+            x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+            control_mask[y1:y2, x1:x2] = 255
+            control_mask = Image.fromarray(control_mask.astype(np.uint8))
+        else:
+            control_mask = None
 
-    if not prompt:
-        prompt = "a person"
+        # Configure ControlNet
+        if len(controlnet_selection) > 0:
+            controlnet_scales = {
+                "canny": canny_strength,
+                "depth": depth_strength,
+            }
+            pipe.controlnet = MultiControlNetModel(
+                [controlnet_identitynet]
+                + [controlnet_map[s] for s in controlnet_selection]
+            )
+            control_scales = [float(identitynet_strength_ratio)] + [
+                controlnet_scales[s] for s in controlnet_selection
+            ]
+            control_images = [face_kps] + [
+                controlnet_map_fn[s](img_controlnet).resize((width, height))
+                for s in controlnet_selection
+            ]
+        else:
+            pipe.controlnet = controlnet_identitynet
+            control_scales = float(identitynet_strength_ratio)
+            control_images = face_kps
 
-    prompt, negative_prompt = apply_style(style_name, prompt, negative_prompt)
+        # Adjust steps for LCM if enabled
+        if enable_LCM:
+            num_steps = max(5, min(num_steps, 10))
+            guidance_scale = max(1.0, min(guidance_scale, 2.0))
 
-    face_image = load_image(face_image_path)
-    face_image = resize_img(face_image, max_side=1024)
-    face_image_cv2 = convert_from_image_to_cv2(face_image)
-    height, width, _ = face_image_cv2.shape
+        generator = torch.Generator(device=device).manual_seed(seed)
 
-    face_info = app.get(face_image_cv2)
-    if len(face_info) == 0:
-        raise gr.Error(
-            "Unable to detect a face in the image. Please upload a different photo with a clear face."
-        )
+        pipe.set_ip_adapter_scale(adapter_strength_ratio)
+        
+        # Generate image
+        images = pipe(
+            prompt=prompt,
+            negative_prompt=negative_prompt,
+            image_embeds=face_emb,
+            image=control_images,
+            control_mask=control_mask,
+            controlnet_conditioning_scale=control_scales,
+            num_inference_steps=num_steps,
+            guidance_scale=guidance_scale,
+            height=height,
+            width=width,
+            generator=generator,
+        ).images
 
-    face_info = sorted(
-        face_info,
-        key=lambda x: (x["bbox"][2] - x["bbox"][0]) * x["bbox"][3] - x["bbox"][1],
-    )[-1]
-    face_emb = face_info["embedding"]
-    face_kps = draw_kps(convert_from_cv2_to_image(face_image_cv2), face_info["kps"])
-    img_controlnet = face_image
+        final_image = images[0]
+        save_as_png(final_image)
+        
+        return final_image
 
-    if enhance_face_region:
-        control_mask = np.zeros([height, width, 3])
-        x1, y1, x2, y2 = face_info["bbox"]
-        x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-        control_mask[y1:y2, x1:x2] = 255
-        control_mask = Image.fromarray(control_mask.astype(np.uint8))
-    else:
-        control_mask = None
+    except gr.Error:
+        raise
+    except Exception as e:
+        raise gr.Error(f"An error occurred during generation: {str(e)}")
 
-    if len(controlnet_selection) > 0:
-        controlnet_scales = {
-            "canny": canny_strength,
-            "depth": depth_strength,
-        }
-        pipe.controlnet = MultiControlNetModel(
-            [controlnet_identitynet]
-            + [controlnet_map[s] for s in controlnet_selection]
-        )
-        control_scales = [float(identitynet_strength_ratio)] + [
-            controlnet_scales[s] for s in controlnet_selection
-        ]
-        control_images = [face_kps] + [
-            controlnet_map_fn[s](img_controlnet).resize((width, height))
-            for s in controlnet_selection
-        ]
-    else:
-        pipe.controlnet = controlnet_identitynet
-        control_scales = float(identitynet_strength_ratio)
-        control_images = face_kps
 
-    generator = torch.Generator(device=device).manual_seed(seed)
+# ============ CSS STYLING ============
+css = """
+/* Main container styling */
+.main-container {
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 20px;
+}
 
-    pipe.set_ip_adapter_scale(adapter_strength_ratio)
-    images = pipe(
-        prompt=prompt,
-        negative_prompt=negative_prompt,
-        image_embeds=face_emb,
-        image=control_images,
-        control_mask=control_mask,
-        controlnet_conditioning_scale=control_scales,
-        num_inference_steps=num_steps,
-        guidance_scale=guidance_scale,
-        height=height,
-        width=width,
-        generator=generator,
-    ).images
+/* Hero section */
+.hero-title {
+    font-size: 2.5em;
+    font-weight: 700;
+    margin-bottom: 10px;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
 
-    final_image = images[0]
+.hero-subtitle {
+    font-size: 1.1em;
+    color: #666;
+    margin-bottom: 30px;
+}
 
-    if not has_valid_license:
-        record_trial_usage(user_id)
-        final_image = apply_watermark(final_image)
-        _, trials_left = can_use_free_trial(user_id)
-        gr.Info(
-            f"Free trial used! {trials_left} generations remaining. Upgrade for watermark-free HD downloads."
-        )
+/* Control cards */
+.control-card {
+    background: #f8f9fa;
+    border-radius: 12px;
+    padding: 20px;
+    margin-bottom: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
 
-    save_as_png(final_image)
+.control-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 15px;
+}
 
-    return final_image
+.control-icon {
+    font-size: 1.5em;
+    margin-right: 10px;
+}
+
+.control-title {
+    font-size: 1.2em;
+    font-weight: 600;
+    margin: 0;
+}
+
+/* Upload area */
+.upload-area {
+    border: 2px dashed #667eea;
+    border-radius: 8px;
+    padding: 20px;
+    text-align: center;
+}
+
+/* Tips card */
+.tips-card {
+    background: #fff3cd;
+    border-left: 4px solid #ffc107;
+    border-radius: 8px;
+    padding: 15px;
+    margin-bottom: 20px;
+}
+
+.tips-header {
+    display: flex;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.tips-icon {
+    font-size: 1.3em;
+    margin-right: 8px;
+}
+
+/* Result card */
+.result-card {
+    background: #f8f9fa;
+    border-radius: 12px;
+    padding: 20px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.result-header {
+    margin-bottom: 20px;
+}
+
+.result-title {
+    font-size: 1.5em;
+    font-weight: 600;
+    margin-bottom: 5px;
+}
+
+.result-subtitle {
+    color: #666;
+    font-size: 0.95em;
+}
+
+/* Image container */
+.image-container {
+    border-radius: 8px;
+    overflow: hidden;
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+/* Success banner */
+.success-banner {
+    background: #d4edda;
+    border: 1px solid #c3e6cb;
+    border-radius: 8px;
+    padding: 15px;
+    margin-top: 15px;
+}
+
+/* Primary button */
+.btn-primary {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    border: none;
+    font-weight: 600;
+    padding: 12px 30px;
+}
+
+.btn-primary:hover {
+    opacity: 0.9;
+    transform: translateY(-1px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.2);
+}
+"""
 
 
 # ============ UI / GRADIO ============
-css = """/* your CSS from earlier unchanged */"""
-
-
 def show_success():
+    """Show success message after generation."""
     return gr.update(
         value="""
         <div class="success-banner">
@@ -547,35 +649,7 @@ def show_success():
     )
 
 
-def update_trial_display(license_key):
-    if verify_license(license_key):
-        return """
-        <div class="trial-banner">
-            <h4 style="margin: 0 0 8px 0;">✅ Premium License Active</h4>
-            <p style="margin: 0; font-size: 0.9em;">Unlimited HD downloads - no watermark</p>
-        </div>
-        """
-
-    user_id = get_user_identifier()
-    can_use, trials_left = can_use_free_trial(user_id)
-
-    if not can_use:
-        return """
-        <div class="trial-banner-error">
-            <h4 style="margin: 0 0 8px 0;">❌ No Free Trials Left</h4>
-            <p style="margin: 0; font-size: 0.9em;">Please purchase a license to continue</p>
-        </div>
-        """
-
-    return f"""
-    <div class="trial-banner">
-        <h4 style="margin: 0 0 8px 0;">🎉 {trials_left} Free Generations Left!</h4>
-        <p style="margin: 0; font-size: 0.9em;">Watermarked previews - upgrade for HD downloads</p>
-    </div>
-    """
-
-
-with gr.Blocks() as demo:
+with gr.Blocks(css=css, theme=gr.themes.Soft()) as demo:
     with gr.Column(elem_classes="main-container"):
         with gr.Column(elem_classes="hero-section"):
             gr.HTML(
@@ -611,43 +685,6 @@ with gr.Blocks() as demo:
                         height=200,
                         show_label=False,
                         elem_classes="upload-area",
-                    )
-
-                with gr.Column(elem_classes="control-card"):
-                    gr.HTML(
-                        """
-                        <div class="control-header">
-                            <div class="control-icon">🔑</div>
-                            <h3 class="control-title">Access Options</h3>
-                        </div>
-                        """
-                    )
-
-                    trial_status = gr.HTML(
-                        f"""
-                        <div class="trial-banner">
-                            <h4 style="margin: 0 0 8px 0;">🎉 {MAX_FREE_TRIALS} FREE Trials Available!</h4>
-                            <p style="margin: 0; font-size: 0.9em;">Try our AI headshot generator - no credit card required</p>
-                        </div>
-                        """
-                    )
-
-                    license_input = gr.Textbox(
-                        label="",
-                        placeholder="Enter license key (or leave blank for free trial)",
-                        show_label=False,
-                        info=f"💡 You get {MAX_FREE_TRIALS} free generations. Purchase license for HD downloads without watermark.",
-                    )
-
-                    gr.HTML(
-                        f"""
-                        <div style="font-size: 0.85em; color: var(--text-secondary); margin-top: 8px;">
-                            <strong>Free Trial:</strong> {MAX_FREE_TRIALS} watermarked previews<br>
-                            <strong>Premium License:</strong> Unlimited HD downloads, no watermark<br>
-                            <strong>Professional Use:</strong> Commercial rights included<br>
-                            <a href="https://canadianheadshotpro.carrd.co" target="_blank" style="color: var(--primary); font-weight: 600;">👉 Click here to purchase license</a>
-                        </div>
-                        """
                     )
 
                 with gr.Column(elem_classes="control-card"):
@@ -786,6 +823,7 @@ with gr.Blocks() as demo:
                         """
                     )
 
+    # Hidden advanced settings
     negative_prompt = gr.Textbox(
         value="(lowres, low quality, worst quality:1.2), (text:1.2), watermark, (frame:1.2), deformed, ugly, deformed eyes, blur, out of focus, blurry, deformed cat, deformed, photo, anthropomorphic cat, monochrome, pet collar, gun, weapon, blue, 3d, drones, drone, buildings in background, green",
         visible=False,
@@ -794,7 +832,7 @@ with gr.Blocks() as demo:
         minimum=5,
         maximum=100,
         step=1,
-        value=30,
+        value=DEFAULT_NUM_STEPS,
         label="Number of steps",
         visible=False,
     )
@@ -802,16 +840,16 @@ with gr.Blocks() as demo:
         minimum=0.1,
         maximum=20.0,
         step=0.1,
-        value=5.0,
+        value=DEFAULT_GUIDANCE_SCALE,
         label="Guidance scale",
         visible=False,
     )
     seed = gr.Slider(
-        minimum=0,
+        minimum=-1,
         maximum=MAX_SEED,
         step=1,
-        value=42,
-        label="Seed",
+        value=-1,
+        label="Seed (-1 for random)",
         visible=False,
     )
     scheduler = gr.Dropdown(
@@ -849,7 +887,6 @@ with gr.Blocks() as demo:
         fn=generate_image,
         inputs=[
             face_file,
-            license_input,
             prompt,
             negative_prompt,
             style,
@@ -868,10 +905,6 @@ with gr.Blocks() as demo:
         outputs=[gallery],
     ).then(fn=show_success, outputs=success_msg)
 
-    license_input.change(
-        fn=update_trial_display, inputs=[license_input], outputs=[trial_status]
-    )
-
     enable_LCM.input(
         fn=toggle_lcm_ui,
         inputs=[enable_LCM],
@@ -879,11 +912,12 @@ with gr.Blocks() as demo:
         queue=False,
     )
 
+    # Cleanup on startup
+    cleanup_old_files()
+
 
 if __name__ == "__main__":
     demo.queue(api_open=False)
     demo.launch(
         share=True,
-        css=css,
-        theme=gr.themes.Soft()
     )
