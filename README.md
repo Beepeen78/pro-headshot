@@ -208,16 +208,6 @@ proheadshots/
 
 ---
 
-## 📈 Business Value
-
-**ROI Metrics:**
-- Time: 5 minutes vs 2-4 hours (95% reduction)
-- Cost: $0-20 vs $100-500 (80-100% savings)
-- Availability: 24/7 vs scheduled sessions
-- Consistency: Uniform quality vs variable results
-
----
-
 ## 🤝 Contributing
 
 Contributions welcome! Please read contributing guidelines before submitting PRs.
