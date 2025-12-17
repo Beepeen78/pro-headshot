@@ -15,23 +15,6 @@ license: apache-2.0
 **Transform any selfie into professional headshots in 20-30 seconds using advanced AI technology.**
 
 ---
-Sample images:
-
-    <img width="849" height="855" alt="image" src="https://github.com/user-attachments/assets/2a28f418-8a45-4cbf-a120-22f65967a0bf" />
-    <img width="862" height="856" alt="image" src="https://github.com/user-attachments/assets/e8c1477e-a9f3-40b9-9580-8e50ae122605" />
-    
-    <img width="893" height="851" alt="image" src="https://github.com/user-attachments/assets/3f87544d-66e6-47cb-b07f-07586fa075fc" />
-    <img width="904" height="833" alt="image" src="https://github.com/user-attachments/assets/cb20b9b6-266d-46eb-b646-cd4996122612" />
-
-    <img width="1233" height="812" alt="image" src="https://github.com/user-attachments/assets/288bc6a8-6992-49f2-9769-d810f8976336" />
-    <img width="1022" height="636" alt="image" src="https://github.com/user-attachments/assets/01458593-8d1d-480e-bd93-50b2ccf147a1" />
-
-
-
-
-    
-
-        
 
 ## 📋 Overview
 
