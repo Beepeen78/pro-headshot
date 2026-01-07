@@ -77,43 +77,6 @@ User Upload → Face Detection → Feature Extraction → AI Generation → Prof
 
 ---
 
-## 💪 Strengths
-
-### Technical
-- ✅ Advanced AI model integration (6+ models)
-- ✅ High identity preservation accuracy
-- ✅ Fast generation (20-30 seconds)
-- ✅ Scalable cloud architecture
-- ✅ Automatic model downloading
-- ✅ GPU memory optimization
-
-### Business
-- ✅ 95% time savings vs traditional photography
-- ✅ 80-100% cost reduction
-- ✅ 24/7 availability
-- ✅ Consistent quality output
-- ✅ No photographer required
-- ✅ Instant results
-
----
-
-## ⚠️ Limitations
-
-### Technical
-- ⚠️ Large model sizes (~15GB total)
-- ⚠️ Requires GPU for optimal performance
-- ⚠️ Single face per image
-- ⚠️ Prompt sensitivity
-- ⚠️ First run model download time (10-20 minutes)
-
-### Business
-- ⚠️ Market competition
-- ⚠️ Quality perception challenges
-- ⚠️ Technical learning curve
-- ⚠️ Legal/ethical considerations
-
----
-
 ## 🚀 Quick Start
 
 ### Prerequisites
@@ -165,15 +128,6 @@ python app.py
 - **Social Media** - High-quality profile pictures
 - **Resume Photos** - Job application headshots
 
----
-
-## 🔒 Privacy & Security
-
-- ✅ All processing occurs locally/on-server
-- ✅ No data sent to external servers
-- ✅ Automatic temporary file cleanup
-- ✅ User data remains private
-- ✅ No third-party data sharing
 
 ---
 
@@ -205,12 +159,6 @@ proheadshots/
 - Standard Python application
 - GPU/CPU support
 - Customizable configuration
-
----
-
-## 🤝 Contributing
-
-Contributions welcome! Please read contributing guidelines before submitting PRs.
 
 ---
 
